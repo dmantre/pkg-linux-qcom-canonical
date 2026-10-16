@@ -116,78 +116,24 @@ static int thermal_set_governor(struct thermal_zone_device *tz,
 	return ret;
 }
 
-int thermal_register_governor(struct thermal_governor *governor)
+static int __init thermal_register_governor(struct thermal_governor *governor)
 {
-	int err;
-	const char *name;
-	struct thermal_zone_device *pos;
 
 	if (!governor)
 		return -EINVAL;
 
-	guard(mutex)(&thermal_governor_lock);
+	if (__find_governor(governor->name))
+		return -EBUSY;
 
-	err = -EBUSY;
-	if (!__find_governor(governor->name)) {
-		bool match_default;
+	list_add(&governor->governor_list, &thermal_governor_list);
 
-		err = 0;
-		list_add(&governor->governor_list, &thermal_governor_list);
-		match_default = !strncmp(governor->name,
-					 DEFAULT_THERMAL_GOVERNOR,
-					 THERMAL_NAME_LENGTH);
+	if (strncmp(governor->name, DEFAULT_THERMAL_GOVERNOR, THERMAL_NAME_LENGTH))
+		return 0;
 
-		if (!def_governor && match_default)
-			def_governor = governor;
-	}
+	if (!def_governor)
+		def_governor = governor;
 
-	guard(mutex)(&thermal_list_lock);
-
-	list_for_each_entry(pos, &thermal_tz_list, node) {
-		/*
-		 * only thermal zones with specified tz->tzp->governor_name
-		 * may run with tz->govenor unset
-		 */
-		if (pos->governor)
-			continue;
-
-		name = pos->tzp->governor_name;
-
-		if (!strncasecmp(name, governor->name, THERMAL_NAME_LENGTH)) {
-			int ret;
-
-			ret = thermal_set_governor(pos, governor);
-			if (ret)
-				dev_err(&pos->device,
-					"Failed to set governor %s for thermal zone %s: %d\n",
-					governor->name, pos->type, ret);
-		}
-	}
-
-	return err;
-}
-
-void thermal_unregister_governor(struct thermal_governor *governor)
-{
-	struct thermal_zone_device *pos;
-
-	if (!governor)
-		return;
-
-	guard(mutex)(&thermal_governor_lock);
-
-	if (!__find_governor(governor->name))
-		return;
-
-	list_del(&governor->governor_list);
-
-	guard(mutex)(&thermal_list_lock);
-
-	list_for_each_entry(pos, &thermal_tz_list, node) {
-		if (!strncasecmp(pos->governor->name, governor->name,
-				 THERMAL_NAME_LENGTH))
-			thermal_set_governor(pos, NULL);
-	}
+	return 0;
 }
 
 int thermal_zone_device_set_policy(struct thermal_zone_device *tz,
@@ -225,40 +171,34 @@ int thermal_build_list_of_policies(char *buf)
 
 static void __init thermal_unregister_governors(void)
 {
-	struct thermal_governor **governor;
+	struct thermal_governor *gov, *pos;
 
-	for_each_governor_table(governor)
-		thermal_unregister_governor(*governor);
+	guard(mutex)(&thermal_governor_lock);
+
+	list_for_each_entry_safe(gov, pos, &thermal_governor_list, governor_list)
+		list_del(&gov->governor_list);
 }
 
 static int __init thermal_register_governors(void)
 {
-	int ret = 0;
 	struct thermal_governor **governor;
 
+	guard(mutex)(&thermal_governor_lock);
+
 	for_each_governor_table(governor) {
+		int ret;
+
 		ret = thermal_register_governor(*governor);
 		if (ret) {
 			pr_err("Failed to register governor: '%s'",
 			       (*governor)->name);
-			break;
+			return ret;
 		}
 
-		pr_info("Registered thermal governor '%s'",
-			(*governor)->name);
+		pr_info("Registered thermal governor '%s'", (*governor)->name);
 	}
 
-	if (ret) {
-		struct thermal_governor **gov;
-
-		for_each_governor_table(gov) {
-			if (gov == governor)
-				break;
-			thermal_unregister_governor(*gov);
-		}
-	}
-
-	return ret;
+	return 0;
 }
 
 static int __thermal_zone_device_set_mode(struct thermal_zone_device *tz,
@@ -695,18 +635,12 @@ int thermal_zone_device_disable(struct thermal_zone_device *tz)
 }
 EXPORT_SYMBOL_GPL(thermal_zone_device_disable);
 
-static bool thermal_zone_is_present(struct thermal_zone_device *tz)
-{
-	return !list_empty(&tz->node);
-}
-
 void thermal_zone_device_update(struct thermal_zone_device *tz,
 				enum thermal_notify_event event)
 {
 	guard(thermal_zone)(tz);
 
-	if (thermal_zone_is_present(tz))
-		__thermal_zone_device_update(tz, event);
+	__thermal_zone_device_update(tz, event);
 }
 EXPORT_SYMBOL_GPL(thermal_zone_device_update);
 
@@ -863,7 +797,7 @@ static int thermal_bind_cdev_to_trip(struct thermal_zone_device *tz,
 		goto free_mem;
 
 	dev->id = result;
-	sprintf(dev->name, "cdev%d", dev->id);
+	snprintf(dev->name, sizeof(dev->name), "cdev%d", dev->id);
 	result =
 	    sysfs_create_link(&tz->device.kobj, &cdev->device.kobj, dev->name);
 	if (result)
@@ -1800,7 +1734,7 @@ static void thermal_zone_pm_prepare(struct thermal_zone_device *tz)
 	cancel_delayed_work(&tz->poll_queue);
 }
 
-static void thermal_pm_notify_prepare(void)
+static void __thermal_pm_prepare(void)
 {
 	struct thermal_zone_device *tz;
 
@@ -1810,6 +1744,19 @@ static void thermal_pm_notify_prepare(void)
 
 	list_for_each_entry(tz, &thermal_tz_list, node)
 		thermal_zone_pm_prepare(tz);
+}
+
+void thermal_pm_prepare(void)
+{
+	if (thermal_class_unavailable)
+		return;
+
+	__thermal_pm_prepare();
+	/*
+	 * Allow any leftover thermal work items already on the worqueue to
+	 * complete so they don't get in the way later.
+	 */
+	flush_workqueue(thermal_wq);
 }
 
 static void thermal_zone_pm_complete(struct thermal_zone_device *tz)
@@ -1828,9 +1775,12 @@ static void thermal_zone_pm_complete(struct thermal_zone_device *tz)
 	mod_delayed_work(thermal_wq, &tz->poll_queue, 0);
 }
 
-static void thermal_pm_notify_complete(void)
+void thermal_pm_complete(void)
 {
 	struct thermal_zone_device *tz;
+
+	if (thermal_class_unavailable)
+		return;
 
 	guard(mutex)(&thermal_list_lock);
 
@@ -1839,41 +1789,6 @@ static void thermal_pm_notify_complete(void)
 	list_for_each_entry(tz, &thermal_tz_list, node)
 		thermal_zone_pm_complete(tz);
 }
-
-static int thermal_pm_notify(struct notifier_block *nb,
-			     unsigned long mode, void *_unused)
-{
-	switch (mode) {
-	case PM_HIBERNATION_PREPARE:
-	case PM_RESTORE_PREPARE:
-	case PM_SUSPEND_PREPARE:
-		thermal_pm_notify_prepare();
-		/*
-		 * Allow any leftover thermal work items already on the
-		 * worqueue to complete so they don't get in the way later.
-		 */
-		flush_workqueue(thermal_wq);
-		break;
-	case PM_POST_HIBERNATION:
-	case PM_POST_RESTORE:
-	case PM_POST_SUSPEND:
-		thermal_pm_notify_complete();
-		break;
-	default:
-		break;
-	}
-	return 0;
-}
-
-static struct notifier_block thermal_pm_nb = {
-	.notifier_call = thermal_pm_notify,
-	/*
-	 * Run at the lowest priority to avoid interference between the thermal
-	 * zone resume work items spawned by thermal_pm_notify() and the other
-	 * PM notifiers.
-	 */
-	.priority = INT_MIN,
-};
 
 static int __init thermal_init(void)
 {
@@ -1885,8 +1800,7 @@ static int __init thermal_init(void)
 	if (result)
 		goto error;
 
-	thermal_wq = alloc_workqueue("thermal_events",
-				      WQ_FREEZABLE | WQ_POWER_EFFICIENT | WQ_PERCPU, 0);
+	thermal_wq = alloc_workqueue("thermal_events", WQ_UNBOUND, 0);
 	if (!thermal_wq) {
 		result = -ENOMEM;
 		goto unregister_netlink;
@@ -1894,7 +1808,7 @@ static int __init thermal_init(void)
 
 	result = thermal_register_governors();
 	if (result)
-		goto destroy_workqueue;
+		goto unregister_governors;
 
 	result = class_register(&thermal_class);
 	if (result)
@@ -1902,16 +1816,10 @@ static int __init thermal_init(void)
 
 	thermal_class_unavailable = false;
 
-	result = register_pm_notifier(&thermal_pm_nb);
-	if (result)
-		pr_warn("Thermal: Can not register suspend notifier, return %d\n",
-			result);
-
 	return 0;
 
 unregister_governors:
 	thermal_unregister_governors();
-destroy_workqueue:
 	destroy_workqueue(thermal_wq);
 unregister_netlink:
 	thermal_netlink_exit();
